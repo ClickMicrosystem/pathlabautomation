@@ -4,9 +4,26 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.database import init_databases
 from tests.helpers import build_capture, deflate_base64_floats
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def isolated_api_dbs(tmp_path, monkeypatch):
+    """Keep API tests isolated from the real runtime SQLite databases."""
+    raw_db = tmp_path / "raw_captures.sqlite3"
+    decoded_db = tmp_path / "decoded_results.sqlite3"
+    mapping_db = tmp_path / "mapping_config.sqlite3"
+
+    monkeypatch.setattr("app.services.database.RAW_DB_PATH", raw_db)
+    monkeypatch.setattr("app.services.database.DECODED_DB_PATH", decoded_db)
+    monkeypatch.setattr("app.services.database.MAPPING_DB_PATH", mapping_db)
+    monkeypatch.setattr("app.services.piysan_service.DECODED_DB_PATH", decoded_db)
+    monkeypatch.setattr("app.services.piysan_service.MAPPING_DB_PATH", mapping_db)
+    init_databases()
+    yield
 
 
 def _sample_capture_bytes() -> bytes:

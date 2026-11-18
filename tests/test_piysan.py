@@ -59,7 +59,7 @@ def isolated_piysan_db(tmp_path, monkeypatch):
         conn.execute(
             """
             INSERT OR REPLACE INTO piysan_settings (id, base_url, mobile, password, jwt_token, token_expires_at, auto_submit)
-            VALUES (1, 'https://staging.piysan.com/', '', '', NULL, NULL, 1)
+            VALUES (1, 'https://www.piysan.com/', '', '', NULL, NULL, 1)
             """
         )
         conn.commit()
@@ -69,7 +69,7 @@ def isolated_piysan_db(tmp_path, monkeypatch):
 def test_init_and_settings():
     init_piysan_db()
     settings = get_piysan_settings()
-    assert settings["base_url"] == "https://staging.piysan.com/"
+    assert settings["base_url"] == "https://www.piysan.com/"
     assert settings["auto_submit"] == 1
 
     # base_url is env-controlled (PIYSAN_BASE_URL) - update_piysan_settings no
@@ -88,11 +88,11 @@ def test_client_login(mock_post):
     mock_response.json.return_value = {"token": "test-jwt-token-123"}
     mock_post.return_value = mock_response
 
-    cli = PiysanClient("https://staging.piysan.com", "9876543210", "mypass")
+    cli = PiysanClient("https://www.piysan.com", "9876543210", "mypass")
     token = cli.login()
     assert token == "test-jwt-token-123"
     mock_post.assert_called_once()
-    assert mock_post.call_args[0][0] == "https://staging.piysan.com/api/lis/login"
+    assert mock_post.call_args[0][0] == "https://www.piysan.com/api/lis/login"
     assert mock_post.call_args[1]["json"] == {"mobile": "9876543210", "password": "mypass"}
 
 
@@ -105,12 +105,43 @@ def test_client_get_bookings(mock_get):
     ]
     mock_get.return_value = mock_response
 
-    cli = PiysanClient("https://staging.piysan.com")
+    cli = PiysanClient("https://www.piysan.com")
     bookings = cli.get_bookings("mytoken", limit=10, offset=0)
     assert len(bookings) == 1
     assert bookings[0]["reference_no"] == "REF001"
     mock_get.assert_called_once()
     assert "Authorization" in mock_get.call_args[1]["headers"]
+
+
+@patch("httpx.Client.get")
+def test_client_get_bookings_paginates_grouped_rows(mock_get):
+    """When Piysan groups multiple raw rows per booking, len(data) < limit on page 1
+    must still continue paginating by limit until total raw rows are covered."""
+    page1 = MagicMock()
+    page1.status_code = 200
+    page1.json.return_value = {
+        "total": 350,
+        "limit": 200,
+        "offset": 0,
+        "data": [{"reference_no": "REF_OLD"}],
+    }
+    page2 = MagicMock()
+    page2.status_code = 200
+    page2.json.return_value = {
+        "total": 350,
+        "limit": 200,
+        "offset": 200,
+        "data": [{"reference_no": "REF_LATEST"}],
+    }
+    mock_get.side_effect = [page1, page2]
+
+    cli = PiysanClient("https://www.piysan.com")
+    bookings = cli.get_bookings("mytoken", limit=200, offset=0)
+
+    assert [b["reference_no"] for b in bookings] == ["REF_OLD", "REF_LATEST"]
+    assert mock_get.call_count == 2
+    assert mock_get.call_args_list[0][1]["params"] == {"limit": 200, "offset": 0}
+    assert mock_get.call_args_list[1][1]["params"] == {"limit": 200, "offset": 200}
 
 
 @patch("httpx.Client.post")
@@ -120,11 +151,11 @@ def test_client_submit_report(mock_post):
     mock_response.json.return_value = {"status": "success"}
     mock_post.return_value = mock_response
 
-    cli = PiysanClient("https://staging.piysan.com")
+    cli = PiysanClient("https://www.piysan.com")
     res = cli.submit_report("mytoken", "REF001", [{"test_id": 1, "value": 10.5}])
     assert res["status"] == "success"
     mock_post.assert_called_once()
-    assert mock_post.call_args[0][0] == "https://staging.piysan.com/api/lis/submit_report"
+    assert mock_post.call_args[0][0] == "https://www.piysan.com/api/lis/submit_report"
 
 
 @patch("app.services.piysan_service.PiysanClient.login")

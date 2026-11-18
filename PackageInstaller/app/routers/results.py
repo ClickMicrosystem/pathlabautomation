@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+import os
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -18,6 +19,7 @@ from app.services.database import (
     upsert_machine,
     upsert_user,
 )
+from app.services.piysan_service import get_current_lab_name
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,13 +28,9 @@ router = APIRouter(tags=["results"])
 BASE_DIR = Path(__file__).resolve().parents[2]
 templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 
-DEMO_USER = "admin"
-LAB_DISPLAY_NAME = "Sk lab"
+DEMO_USER = os.environ.get("ADMIN_USERNAME", "admin")
 DEFAULT_MACHINE_NAMES = [
     "HORIBA Yumizen H500",
-    "Machine 1 (dummy)",
-    "Machine 2 (dummy)",
-    "Machine 3 (dummy)",
 ]
 RAW_CAPTURE_LIMIT = 100
 
@@ -56,10 +54,11 @@ def _packet_identifiers(payload: str) -> Dict[str, Any]:
 
 
 def _ensure_user_and_machines():
+    lab_name = get_current_lab_name()
     users = load_users()
     if not users:
-        user_id = upsert_user(LAB_DISPLAY_NAME)
-        users = [{"id": user_id, "user_name": LAB_DISPLAY_NAME}]
+        user_id = upsert_user(lab_name)
+        users = [{"id": user_id, "user_name": lab_name}]
     user = users[0]
     machines = load_machines(user["id"])
     if not machines:
@@ -89,7 +88,7 @@ async def test_results_page(request: Request):
         context={
             "request": request,
             "username": request.session.get("username", DEMO_USER),
-            "customer_name": LAB_DISPLAY_NAME,
+            "customer_name": get_current_lab_name(),
             "machines": machines,
             "active_machine": machine,
             "raw_captures": raw_captures,

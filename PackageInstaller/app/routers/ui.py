@@ -8,7 +8,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from app.services.database import (
+    create_connection,
+    delete_connection,
     delete_test_mapping,
+    get_connection,
+    list_connections,
     load_lab_test_master,
     load_machine_test_master,
     load_machines,
@@ -16,13 +20,17 @@ from app.services.database import (
     load_users,
     save_catalog_rows,
     save_test_mapping,
+    set_connection_enabled,
     test_mapping_exists,
     upsert_machine,
     upsert_user,
     get_or_create_lab_test,
+    seed_default_test_mappings,
 )
 from app.services.excel_catalog import load_catalog
 from app.services.astm_sender import push_astm_order
+from app.services.serial_listener import list_available_ports
+from app.services.piysan_service import get_current_lab_name
 
 router = APIRouter(tags=["ui"])
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -30,15 +38,38 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 
 DEMO_USER = os.environ.get("ADMIN_USERNAME", "admin")
 DEMO_PASS = os.environ.get("ADMIN_PASSWORD", "admin123")
-LAB_DISPLAY_NAME = "Sk lab"
-DEFAULT_MACHINE_NAMES = []
-LAB_ADDRESS = "Sk lab, Sample Street, Sample City"
-LAB_CONTACT = "+91 90000 00000"
-COMPUTER_IP = "192.168.1.20"
-COMPUTER_SUBNET_MASK = "255.255.255.0"
-DEFAULT_MACHINE_IP = "192.168.1.55"
-DEFAULT_MACHINE_SUBNET_MASK = "255.255.255.0"
-DEFAULT_MACHINE_PORT = "5000"
+
+
+def get_local_ip() -> str:
+    """Dynamically determine the host computer's primary LAN IPv4 address."""
+    env_ip = os.getenv("COMPUTER_IP", "").strip()
+    if env_ip:
+        return env_ip
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    try:
+        import socket
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+DEFAULT_MACHINE_IP = os.getenv("MACHINE_IP", "192.168.1.55")
+DEFAULT_MACHINE_PORT = os.getenv("MACHINE_PORT", "5000")
+COMPUTER_SUBNET_MASK = os.getenv("SUBNET_MASK", "255.255.255.0")
+DEFAULT_MACHINE_SUBNET_MASK = os.getenv("SUBNET_MASK", "255.255.255.0")
 
 
 def _authed(request: Request) -> bool:
@@ -136,19 +167,29 @@ async def dashboard_page(request: Request):
     if not _authed(request):
         return RedirectResponse("/login", status_code=302)
     _ensure_catalog()
+    lab_name = get_current_lab_name()
     users = load_users()
     if not users:
-        user_id = upsert_user(LAB_DISPLAY_NAME)
-        users = [{"id": user_id, "user_name": LAB_DISPLAY_NAME}]
+        user_id = upsert_user(lab_name)
+        users = [{"id": user_id, "user_name": lab_name}]
     user = users[0]
     machines = load_machines(user["id"])
     if not machines:
-        machines = []
+        upsert_machine(user["id"], "HORIBA Yumizen H500")
+        machines = load_machines(user["id"])
+    if machines:
+        seed_default_test_mappings(user["id"], machines[0]["id"])
     machine_test_count = sum(len(load_test_mappings(user["id"], machine["id"])) for machine in machines)
 
     from app.services.piysan_service import load_enriched_bookings, get_piysan_settings
     bookings = load_enriched_bookings()
     settings = get_piysan_settings()
+
+    connection_status = {s["id"]: s["running"] for s in request.app.state.connection_manager.status()}
+    connections = [
+        {**c, "running": connection_status.get(c["id"], False)}
+        for c in list_connections()
+    ]
 
     total_orders = len(bookings)
     pending_count = sum(1 for b in bookings if not b.get("has_match") and not b.get("is_skipped"))
@@ -162,18 +203,19 @@ async def dashboard_page(request: Request):
         context={
             "request": request,
             "username": request.session.get("username", DEMO_USER),
-            "user_name": LAB_DISPLAY_NAME,
-            "address": LAB_ADDRESS,
-            "contact": LAB_CONTACT,
+            "user_name": lab_name,
+            "address": os.getenv("LAB_ADDRESS", "Main Laboratory Facility"),
+            "contact": os.getenv("LAB_CONTACT", ""),
             "machines": machines,
             "machine_ip": DEFAULT_MACHINE_IP,
             "machine_subnet_mask": DEFAULT_MACHINE_SUBNET_MASK,
             "machine_port": DEFAULT_MACHINE_PORT,
-            "computer_ip": COMPUTER_IP,
+            "computer_ip": get_local_ip(),
             "computer_subnet_mask": COMPUTER_SUBNET_MASK,
             "test_count": machine_test_count,
             "bookings": bookings,
             "settings": settings,
+            "connections": connections,
             "total_orders": total_orders,
             "pending_count": pending_count,
             "decoded_count": decoded_count,
@@ -183,21 +225,80 @@ async def dashboard_page(request: Request):
     )
 
 
+@router.post("/connections", include_in_schema=False)
+async def add_connection(
+    request: Request,
+    label: str = Form(...),
+    connection_type: str = Form(...),
+    tcp_port: int = Form(None),
+    com_port: str = Form(None),
+    baud_rate: int = Form(None),
+):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=302)
+
+    if connection_type not in ("network", "serial"):
+        return RedirectResponse("/dashboard?error=Invalid+connection+type", status_code=302)
+
+    create_connection(
+        label=label.strip() or ("Network Connection" if connection_type == "network" else "USB Connection"),
+        connection_type=connection_type,
+        tcp_port=tcp_port if connection_type == "network" else None,
+        com_port=com_port if connection_type == "serial" else None,
+        baud_rate=baud_rate if connection_type == "serial" else None,
+    )
+    request.app.state.connection_manager.sync_from_db()
+    return RedirectResponse("/dashboard", status_code=302)
+
+
+@router.post("/connections/{connection_id}/toggle", include_in_schema=False)
+async def toggle_connection(connection_id: int, request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=302)
+
+    row = get_connection(connection_id)
+    if row:
+        set_connection_enabled(connection_id, not row["enabled"])
+        request.app.state.connection_manager.sync_from_db()
+    return RedirectResponse("/dashboard", status_code=302)
+
+
+@router.post("/connections/{connection_id}/delete", include_in_schema=False)
+async def remove_connection(connection_id: int, request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=302)
+
+    delete_connection(connection_id)
+    request.app.state.connection_manager.sync_from_db()
+    return RedirectResponse("/dashboard", status_code=302)
+
+
+@router.get("/connections/available-ports", include_in_schema=False)
+async def available_ports(request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    return JSONResponse(list_available_ports())
+
+
 @router.get("/mapping", response_class=HTMLResponse, include_in_schema=False)
 async def mapping_page(request: Request):
     if not _authed(request):
         return RedirectResponse("/login", status_code=302)
     _ensure_catalog()
+    lab_name = get_current_lab_name()
     users = load_users()
     if not users:
-        user_id = upsert_user(LAB_DISPLAY_NAME)
-        users = [{"id": user_id, "user_name": LAB_DISPLAY_NAME}]
+        user_id = upsert_user(lab_name)
+        users = [{"id": user_id, "user_name": lab_name}]
     user = users[0]
     machines = load_machines(user["id"])
     if not machines:
-        machines = []
+        upsert_machine(user["id"], "HORIBA Yumizen H500")
+        machines = load_machines(user["id"])
     requested_machine_id = request.query_params.get("machine_id")
     machine = next((m for m in machines if str(m["id"]) == str(requested_machine_id)), machines[0] if machines else None)
+    if machine:
+        seed_default_test_mappings(user["id"], machine["id"])
     catalog = load_catalog()
     machine_rows = []
     if machine:
@@ -231,7 +332,7 @@ async def mapping_page(request: Request):
         context={
             "request": request,
             "username": request.session.get("username", DEMO_USER),
-            "customer_name": LAB_DISPLAY_NAME,
+            "customer_name": lab_name,
             "user": user,
             "machines": machines,
             "active_machine": machine,
@@ -283,6 +384,13 @@ async def push_command_page(request: Request):
     from app.services.piysan_service import load_enriched_bookings
     piysan_bookings = load_enriched_bookings()
 
+    connection_status = {s["id"]: s["running"] for s in request.app.state.connection_manager.status()}
+    connections = [
+        {**c, "running": connection_status.get(c["id"], False)}
+        for c in list_connections()
+        if c["enabled"]
+    ]
+
     # Extract query parameters for pre-filling
     sample_id = request.query_params.get("sample_id", "")
     patient_id = request.query_params.get("patient_id", "")
@@ -314,8 +422,8 @@ async def push_command_page(request: Request):
         context={
             "request": request,
             "username": request.session.get("username", DEMO_USER),
-            "default_ip": DEFAULT_MACHINE_IP,
-            "default_port": DEFAULT_MACHINE_PORT,
+            "user_name": get_current_lab_name(),
+            "connections": connections,
             "result_log": None,
             "machine_options": machine_options,
             "piysan_bookings": piysan_bookings,
@@ -335,8 +443,7 @@ async def push_command_page(request: Request):
 @router.post("/push-command/execute", response_class=HTMLResponse, include_in_schema=False)
 async def execute_push_command(
     request: Request,
-    ip: str = Form(...),
-    port: int = Form(...),
+    connection_id: int = Form(...),
     sample_id: str = Form(...),
     patient_id: str = Form(...),
     patient_name: str = Form(""),
@@ -346,15 +453,15 @@ async def execute_push_command(
 ):
     if not _authed(request):
         return RedirectResponse("/login", status_code=302)
-    
+
     # Map selected Lab Test IDs to Machine Test IDs using configured mappings
     from app.services.database import load_latest_installation_mapping_lookup
     mapping_lookup = load_latest_installation_mapping_lookup()
     reverse_lookup = {lab_id: mach_id for mach_id, lab_id in mapping_lookup.items() if lab_id and mach_id}
-    
+
     mapped_test_ids = [reverse_lookup.get(tid, tid) for tid in test_ids]
-    
-    listener = request.app.state.listener
+
+    listener = request.app.state.connection_manager.get(connection_id)
     result_log = push_astm_order(listener, sample_id, patient_id, mapped_test_ids, patient_name, dob, gender)
 
     catalog = load_catalog()
@@ -366,14 +473,21 @@ async def execute_push_command(
     from app.services.piysan_service import load_enriched_bookings
     piysan_bookings = load_enriched_bookings()
 
+    connection_status = {s["id"]: s["running"] for s in request.app.state.connection_manager.status()}
+    connections = [
+        {**c, "running": connection_status.get(c["id"], False)}
+        for c in list_connections()
+        if c["enabled"]
+    ]
+
     return templates.TemplateResponse(
         request=request,
         name="push_command.html",
         context={
             "request": request,
             "username": request.session.get("username", DEMO_USER),
-            "default_ip": ip,
-            "default_port": port,
+            "connections": connections,
+            "selected_connection_id": connection_id,
             "result_log": result_log,
             "machine_options": machine_options,
             "piysan_bookings": piysan_bookings,
@@ -416,7 +530,7 @@ async def quick_push_order(request: Request):
     reverse_lookup = {lab_id: mach_id for mach_id, lab_id in mapping_lookup.items() if lab_id and mach_id}
     mapped_test_ids = [reverse_lookup.get(tid, tid) for tid in test_ids]
 
-    listener = getattr(request.app.state, "listener", None)
+    listener = request.app.state.connection_manager.first_running()
     result_log = push_astm_order(listener, sample_id, patient_id, mapped_test_ids, patient_name, dob, gender)
     is_error = "Error:" in result_log or "error" in result_log.lower()
 

@@ -33,8 +33,8 @@ from app.routers import decode
 from app.routers import results
 from app.routers import ui
 from app.routers import piysan
+from app.services.connection_manager import ConnectionManager
 from app.services.database import init_databases
-from app.services.socket_listener import AnalyzerListener
 
 app = FastAPI(
     title="HORIBA Yumizen H500/H500E ASTM Decoder",
@@ -75,18 +75,14 @@ class IdleSessionTimeoutMiddleware(BaseHTTPMiddleware):
 # by the time our idle check runs.
 app.add_middleware(IdleSessionTimeoutMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY, same_site="lax")
-listener = AnalyzerListener()
+connection_manager = ConnectionManager()
 _watchdog_stop = threading.Event()
 
 
 def _listener_watchdog() -> None:
     while not _watchdog_stop.is_set():
         time.sleep(10)
-        if not listener.is_running():
-            try:
-                listener.ensure_running()
-            except Exception:
-                pass
+        connection_manager.ensure_all_running()
 
 
 @app.on_event("startup")
@@ -95,8 +91,8 @@ async def startup_event() -> None:
 
     ensure_licensed()
     init_databases()
-    listener.start()
-    app.state.listener = listener
+    connection_manager.sync_from_db()
+    app.state.connection_manager = connection_manager
     if not hasattr(app.state, "watchdog_thread") or not app.state.watchdog_thread.is_alive():
         _watchdog_stop.clear()
         app.state.watchdog_thread = threading.Thread(target=_listener_watchdog, daemon=True, name="ListenerWatchdog")
@@ -106,9 +102,14 @@ async def startup_event() -> None:
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     _watchdog_stop.set()
-    listener.stop()
+    connection_manager.stop_all()
 
 
 @app.get("/health", tags=["meta"])
 async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok", "listener_running": listener.is_running()})
+    statuses = connection_manager.status()
+    return JSONResponse({
+        "status": "ok",
+        "connections": statuses,
+        "listener_running": any(s["running"] for s in statuses),
+    })

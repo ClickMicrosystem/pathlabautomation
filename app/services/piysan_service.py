@@ -1,7 +1,7 @@
 """Piysan LIS Integration Service.
 
 Manages integration settings, cached bookings, submission logs, and HTTP communication
-with the Piysan LIS staging and production API endpoints.
+with the Piysan LIS production API endpoints.
 """
 from __future__ import annotations
 
@@ -18,7 +18,102 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_PIYSAN_BASE_URL = "https://staging.piysan.com/"
+DEFAULT_PIYSAN_BASE_URL = "https://www.piysan.com/"
+
+DEFAULT_CBC_MACHINE_TO_LAB_MAP: Dict[str, str] = {
+    # Short names
+    "HGB": "1",
+    "RBC": "2",
+    "PLT": "3",
+    "WBC": "4",
+    "NEU%": "5",
+    "NEU#": "5",
+    "LYM%": "6",
+    "LYM#": "6",
+    "MON%": "7",
+    "MON#": "7",
+    "EOS%": "8",
+    "EOS#": "8",
+    "BAS%": "9",
+    "BAS#": "9",
+    "HCT": "15",
+    "RDW-CV": "19",
+    "RDW-SD": "20",
+    "MPV": "21",
+    "P-LCR": "24",
+    "P-LCC": "25",
+    "PDW": "431",
+    "PCT": "534",
+    # LOINC codes
+    "718-7": "1",
+    "789-8": "2",
+    "777-3": "3",
+    "6690-2": "4",
+    "770-8": "5",
+    "751-8": "5",
+    "736-9": "6",
+    "731-0": "6",
+    "5905-5": "7",
+    "742-7": "7",
+    "713-8": "8",
+    "711-2": "8",
+    "706-2": "9",
+    "704-7": "9",
+    "4544-3": "15",
+    "788-0": "19",
+    "21000-5": "20",
+    "32623-1": "21",
+    "48386-7": "24",
+    "96354-6": "25",
+    "51631-0": "431",
+    "51637-7": "534",
+}
+
+
+def _resolve_result_test_id(code: str, result_entry: Dict[str, Any], booking: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a raw analyzer/test code to a valid numeric Piysan test_id string."""
+    # 1. If code is already a numeric string (e.g. "1", "4", "15")
+    if str(code).isdigit():
+        return str(code)
+
+    # 2. Check lab_test_code in result_entry if set during report generation
+    lab_code = result_entry.get("lab_test_code")
+    if lab_code and str(lab_code).isdigit():
+        return str(lab_code)
+
+    dev_code = result_entry.get("device_test_code")
+
+    # 3. Check active database mapping lookup
+    try:
+        from app.services.database import load_latest_installation_mapping_lookup
+        mapping_lookup = load_latest_installation_mapping_lookup()
+        for c in (code, dev_code):
+            if c:
+                db_tid = mapping_lookup.get(c)
+                if db_tid and str(db_tid).isdigit():
+                    return str(db_tid)
+    except Exception:
+        pass
+
+    # 4. Standard HORIBA CBC code fallback map
+    for c in (code, dev_code):
+        if c:
+            fallback = DEFAULT_CBC_MACHINE_TO_LAB_MAP.get(str(c).upper())
+            if fallback:
+                return str(fallback)
+
+    # 5. Check test_name against booking machine tests
+    if booking:
+        t_name = (result_entry.get("test_name") or "").lower().strip()
+        if t_name:
+            for m in booking.get("machines", []):
+                for t in m.get("tests", []):
+                    bt_name = (t.get("test_name") or "").lower().strip()
+                    bt_id = str(t.get("test_id") or "")
+                    if bt_id.isdigit() and (t_name == bt_name or t_name in bt_name or bt_name in t_name):
+                        return bt_id
+
+    return None
 
 
 def get_piysan_base_url() -> str:
@@ -48,12 +143,13 @@ class PiysanClient:
         }
         logger.info("Sending login request to Piysan LIS at %s", url)
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
                 resp = client.post(url, json=payload)
                 if resp.status_code != 200:
                     logger.error("Piysan LIS login failed (%s): %s", resp.status_code, resp.text)
                     resp.raise_for_status()
                 data = resp.json()
+                self.last_lab_info = data.get("lab") or {}
                 
                 # Robust extraction check for the token
                 token = (
@@ -79,7 +175,7 @@ class PiysanClient:
         }
         all_bookings: List[Dict[str, Any]] = []
         current_offset = offset
-        with httpx.Client(timeout=20.0) as client:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
             while True:
                 params = {
                     "limit": limit,
@@ -92,10 +188,12 @@ class PiysanClient:
 
                 batch = []
                 total = 0
+                page_limit = limit
                 if isinstance(data, list):
                     batch = data
                 elif isinstance(data, dict):
-                    total = data.get("total", 0)
+                    total = int(data.get("total") or 0)
+                    page_limit = int(data.get("limit") or limit)
                     batch = data.get("bookings") or data.get("data") or data.get("results") or []
                     if not isinstance(batch, list):
                         batch = [data]
@@ -104,11 +202,21 @@ class PiysanClient:
                     break
 
                 all_bookings.extend(batch)
-                current_offset += len(batch)
 
-                # Stop if we fetched all items reported by total or batch was smaller than limit
-                if (total > 0 and current_offset >= total) or len(batch) < limit:
-                    break
+                if total > 0:
+                    # Piysan's SQL pagination applies LIMIT/OFFSET to raw test rows before
+                    # grouping them into booking objects, so len(batch) is smaller than limit.
+                    # Advance by the server's page_limit until we pass total.
+                    step = page_limit if page_limit > 0 else limit
+                    if step <= 0:
+                        break
+                    current_offset += step
+                    if current_offset >= total:
+                        break
+                else:
+                    current_offset += len(batch)
+                    if len(batch) < limit:
+                        break
 
         return all_bookings
 
@@ -138,9 +246,22 @@ class PiysanClient:
             "results": formatted_results,
         }
         logger.info("Submitting report to Piysan LIS at %s for reference_no=%s: %s", url, reference_no, payload)
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                error_msg = f"HTTP {resp.status_code}"
+                try:
+                    err_json = resp.json()
+                    if isinstance(err_json, dict) and err_json.get("message"):
+                        error_msg = err_json.get("message")
+                        if err_json.get("invalid_test_ids"):
+                            error_msg += f" (invalid test IDs: {err_json.get('invalid_test_ids')})"
+                    elif isinstance(err_json, dict) and err_json.get("error"):
+                        error_msg = str(err_json.get("error"))
+                except Exception:
+                    error_msg = f"HTTP {resp.status_code}: {resp.text}"
+                logger.error("Piysan submit_report failed (%s): %s", resp.status_code, error_msg)
+                raise ValueError(f"Piysan LIS error: {error_msg}")
             return resp.json()
 
 
@@ -151,7 +272,7 @@ def init_piysan_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS piysan_settings (
                 id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-                base_url TEXT NOT NULL DEFAULT 'https://staging.piysan.com/',
+                base_url TEXT NOT NULL DEFAULT 'https://www.piysan.com/',
                 mobile TEXT,
                 password TEXT,
                 jwt_token TEXT,
@@ -178,6 +299,11 @@ def init_piysan_db() -> None:
             conn.execute("ALTER TABLE piysan_bookings ADD COLUMN is_skipped INTEGER DEFAULT 0")
         except Exception:
             pass
+        for col in ["lab_name TEXT", "brand_name TEXT", "lab_email TEXT"]:
+            try:
+                conn.execute(f"ALTER TABLE piysan_settings ADD COLUMN {col}")
+            except Exception:
+                pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS piysan_submissions (
@@ -196,7 +322,7 @@ def init_piysan_db() -> None:
         conn.execute(
             """
             INSERT OR IGNORE INTO piysan_settings (id, base_url, mobile, password, jwt_token, token_expires_at, auto_submit)
-            VALUES (1, 'https://staging.piysan.com/', '', '', NULL, NULL, 1)
+            VALUES (1, 'https://www.piysan.com/', '', '', NULL, NULL, 1)
             """
         )
         conn.commit()
@@ -226,19 +352,69 @@ def update_piysan_settings(mobile: str, password: str, auto_submit: int) -> None
         conn.commit()
 
 
-def update_piysan_token(token: str, expires_at: str) -> None:
-    """Cache the authenticated JWT access token."""
+def update_piysan_token(token: str, expires_at: str, lab_info: Optional[Dict[str, Any]] = None) -> None:
+    """Cache the authenticated JWT access token and laboratory profile."""
     init_piysan_db()
+    lab_name = (lab_info or {}).get("lab_name") if lab_info else None
+    brand_name = (lab_info or {}).get("brand_name") if lab_info else None
+    lab_email = (lab_info or {}).get("email") if lab_info else None
     with _lock, _connect(MAPPING_DB_PATH) as conn:
         conn.execute(
             """
             UPDATE piysan_settings
-            SET jwt_token = ?, token_expires_at = ?, updated_at = CURRENT_TIMESTAMP
+            SET jwt_token = ?, token_expires_at = ?,
+                lab_name = COALESCE(?, lab_name),
+                brand_name = COALESCE(?, brand_name),
+                lab_email = COALESCE(?, lab_email),
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = 1
             """,
-            (token, expires_at),
+            (token, expires_at, lab_name, brand_name, lab_email),
         )
+        effective_name = brand_name or lab_name
+        if effective_name:
+            try:
+                conn.execute(
+                    """
+                    UPDATE users SET user_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1
+                    """,
+                    (effective_name,),
+                )
+            except Exception:
+                pass
         conn.commit()
+
+
+def get_current_lab_name() -> str:
+    """Return the display name of the current laboratory."""
+    try:
+        settings = get_piysan_settings()
+        brand = (settings.get("brand_name") or "").strip()
+        lab = (settings.get("lab_name") or "").strip()
+        if brand and lab and brand != lab:
+            return f"{brand} ({lab})"
+        if brand:
+            return brand
+        if lab:
+            return lab
+    except Exception:
+        pass
+
+    env_name = os.getenv("LAB_NAME", "").strip()
+    if env_name:
+        return env_name
+
+    try:
+        from app.services.database import load_users
+        users = load_users()
+        if users and users[0].get("user_name"):
+            name = users[0]["user_name"].strip()
+            if name and name.lower() not in ("sk lab", "sk_lab", "acme diagnostics"):
+                return name
+    except Exception:
+        pass
+
+    return "Clinical Pathology Laboratory"
 
 
 def execute_piysan_request(func_name: str, *args, **kwargs) -> Any:
@@ -254,7 +430,7 @@ def execute_piysan_request(func_name: str, *args, **kwargs) -> Any:
         # Force a live login call (e.g. for "Test Connection") - bypass token cache entirely.
         token = client.login()
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).replace(tzinfo=None).isoformat()
-        update_piysan_token(token, expires_at)
+        update_piysan_token(token, expires_at, getattr(client, "last_lab_info", None))
         return token
 
     # Resolve token cache validation
@@ -275,7 +451,7 @@ def execute_piysan_request(func_name: str, *args, **kwargs) -> Any:
         logger.info("Piysan token is expired or missing. Fetching new token...")
         token = client.login()
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).replace(tzinfo=None).isoformat()
-        update_piysan_token(token, expires_at)
+        update_piysan_token(token, expires_at, getattr(client, "last_lab_info", None))
 
     api_func = getattr(client, func_name)
     try:
@@ -286,7 +462,7 @@ def execute_piysan_request(func_name: str, *args, **kwargs) -> Any:
             logger.warning("Piysan request failed with 401. Retrying with a fresh token...")
             token = client.login()
             expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).replace(tzinfo=None).isoformat()
-            update_piysan_token(token, expires_at)
+            update_piysan_token(token, expires_at, getattr(client, "last_lab_info", None))
             return api_func(token, *args, **kwargs)
         raise
 
@@ -517,27 +693,30 @@ def load_enriched_bookings() -> List[Dict[str, Any]]:
             has_match = True
             match_capture_id = capture_data["raw_capture_id"]
             report = capture_data["report"]
+            booking_raw = b.get("raw_data_parsed")
 
             # The Piysan get_bookings API does not return a test_id per test (only
             # test_name), so we can't cross-check decoded results against the
             # booking's own tests by ID. Order-level match (same reference_no /
             # sample_id) is the check that matters - show every decoded numeric
             # result for this order.
-            for test_id_str, result_entry in report.get("results", {}).items():
+            for test_key, result_entry in report.get("results", {}).items():
                 try:
                     val = result_entry.get("value")
                     if val is not None:
                         val_float = float(val)
-                        test_id = int(test_id_str)
+                        resolved_id = _resolve_result_test_id(str(test_key), result_entry, booking_raw)
+                        display_id = int(resolved_id) if (resolved_id and resolved_id.isdigit()) else test_key
+                        t_name = result_entry.get("test_name") or str(test_key)
                         match_results.append({
-                            "test_id": test_id,
-                            "test_name": result_entry.get("test_name") or f"Test #{test_id}",
+                            "test_id": display_id,
+                            "test_name": t_name,
                             "value": val_float,
                             "unit": result_entry.get("unit") or "",
                             "flags": result_entry.get("flags") or [],
                             "reference_range": result_entry.get("reference_range") or {},
                         })
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
 
         last_status = "Not Submitted"
@@ -642,21 +821,24 @@ def trigger_auto_submit(raw_capture_id: int, report: Dict[str, Any]) -> None:
         logger.info("Booking %s could not be confirmed with Piysan. Skipping auto-submit.", reference_no)
         return
 
-    # The Piysan get_bookings API does not return a test_id per test (only
-    # test_name), so per-test cross-checking against the booking isn't possible.
-    # The order-level check (this reference_no is a real booking for this lab,
-    # and it has decoded numeric results) is what gates the submission.
+    # Resolve each test code to a verified numeric Piysan test_id before submitting.
     results_to_submit = {}
-    for test_id_str, result_entry in results_dict.items():
-        try:
-            val = result_entry.get("value")
-            if val is not None:
-                results_to_submit[str(test_id_str)] = float(val)
-        except ValueError:
+    for test_key, result_entry in results_dict.items():
+        val = result_entry.get("value")
+        if val is None:
             continue
+        try:
+            num_val = float(val)
+        except (ValueError, TypeError):
+            continue
+        tid = _resolve_result_test_id(str(test_key), result_entry, booking)
+        if tid and str(tid).isdigit():
+            results_to_submit[str(tid)] = num_val
+        else:
+            logger.warning("Auto-submit: could not map test code '%s' to a numeric Piysan test_id for booking %s", test_key, reference_no)
 
     if not results_to_submit:
-        logger.info("No numeric results found for reference_no=%s. Skipping submit.", reference_no)
+        logger.info("No valid mapped numeric results found for reference_no=%s. Skipping submit.", reference_no)
         return
 
     try:
@@ -711,21 +893,26 @@ def manual_submit_to_piysan(reference_no: str) -> Dict[str, Any]:
     if not booking:
         raise ValueError(f"Order {reference_no} was not found among bookings received from Piysan. Fetch latest bookings and try again.")
 
-    # The Piysan get_bookings API does not return a test_id per test (only
-    # test_name), so per-test cross-checking against the booking isn't possible.
-    # The order-level check above (this reference_no is a real booking for this
-    # lab) plus having decoded numeric results is what gates the submission.
+    # Resolve each decoded test code to a verified numeric Piysan test_id before submitting.
     results_to_submit = {}
-    for test_id_str, result_entry in report.get("results", {}).items():
-        try:
-            val = result_entry.get("value")
-            if val is not None:
-                results_to_submit[str(test_id_str)] = float(val)
-        except ValueError:
+    unmapped_codes = []
+    for test_key, result_entry in report.get("results", {}).items():
+        val = result_entry.get("value")
+        if val is None:
             continue
+        try:
+            num_val = float(val)
+        except (ValueError, TypeError):
+            continue
+        tid = _resolve_result_test_id(str(test_key), result_entry, booking)
+        if tid and str(tid).isdigit():
+            results_to_submit[str(tid)] = num_val
+        else:
+            unmapped_codes.append(str(test_key))
 
     if not results_to_submit:
-        raise ValueError(f"No numeric test results decoded yet for reference_no: {reference_no}")
+        detail = f" (unmapped codes: {', '.join(unmapped_codes)})" if unmapped_codes else ""
+        raise ValueError(f"No mapped numeric test results found for reference_no: {reference_no}{detail}")
 
     try:
         response = execute_piysan_request("submit_report", reference_no, results_to_submit)

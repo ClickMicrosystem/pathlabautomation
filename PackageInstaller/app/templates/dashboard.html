@@ -946,7 +946,7 @@
       <div class="header-actions">
         <form method="post" action="/piysan/fetch-bookings" id="syncForm" style="margin: 0;">
           <input type="hidden" name="next_page" value="/dashboard">
-          <button type="submit" class="btn btn-secondary" id="btnSyncBookings" title="Fetch latest orders from Piysan staging server">
+          <button type="submit" class="btn btn-secondary" id="btnSyncBookings" title="Fetch latest orders from Piysan LIS server">
             <span>&#x21bb;</span> Fetch Latest Orders
           </button>
         </form>
@@ -1078,10 +1078,6 @@
           </div>
         </div>
         <div class="info-tile">
-          <div class="tile-lbl">Analyzer Target IP &amp; Port</div>
-          <div class="tile-val"><span class="ref-code">{{ machine_ip }}:{{ machine_port }}</span></div>
-        </div>
-        <div class="info-tile">
           <div class="tile-lbl">Host / Computer IP Address</div>
           <div class="tile-val"><span class="ref-code">{{ computer_ip }}</span></div>
         </div>
@@ -1089,6 +1085,104 @@
           <div class="tile-lbl">Total ASTM Results Decoded</div>
           <div class="tile-val" style="color: var(--accent-indigo); font-size: 18px; font-weight: 800;">{{ test_count }}</div>
         </div>
+      </div>
+
+      <!-- Analyzer Connections (Network / USB Serial) -->
+      <div style="margin-top: 24px;">
+        <div style="font-weight: 700; font-size: 14px; margin-bottom: 12px;">Analyzer Connections</div>
+        <div style="overflow-x: auto; border: 1px solid var(--border-color); border-radius: 12px;">
+          <table class="orders-table" style="min-width: 640px;">
+            <thead>
+              <tr>
+                <th>Label</th>
+                <th>Type</th>
+                <th>Connection Params</th>
+                <th>Status</th>
+                <th style="text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for c in connections %}
+              <tr>
+                <td>{{ c.label }}</td>
+                <td>
+                  {% if c.connection_type == 'network' %}
+                    <span class="badge badge-muted">Network (LAN)</span>
+                  {% else %}
+                    <span class="badge badge-muted">USB / Serial</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if c.connection_type == 'network' %}
+                    <span class="ref-code">0.0.0.0:{{ c.tcp_port }}</span>
+                  {% else %}
+                    <span class="ref-code">{{ c.com_port }} @ {{ c.baud_rate }} baud</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if not c.enabled %}
+                    <span class="badge badge-muted">Disabled</span>
+                  {% elif c.running %}
+                    <span class="badge badge-success">Running</span>
+                  {% else %}
+                    <span class="badge badge-warning">Starting&hellip;</span>
+                  {% endif %}
+                </td>
+                <td style="text-align: right; white-space: nowrap;">
+                  <form method="post" action="/connections/{{ c.id }}/toggle" style="display: inline;">
+                    <button class="btn btn-secondary btn-icon" type="submit">{{ 'Disable' if c.enabled else 'Enable' }}</button>
+                  </form>
+                  <form method="post" action="/connections/{{ c.id }}/delete" style="display: inline;" onsubmit="return confirm('Remove connection &quot;{{ c.label }}&quot;?');">
+                    <button class="btn btn-warning btn-icon" type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+              {% else %}
+              <tr>
+                <td colspan="5" style="text-align: center; color: var(--text-muted); font-style: italic; padding: 24px;">No analyzer connections configured yet. Add one below.</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <form method="post" action="/connections" id="formAddConnection" style="margin-top: 16px; display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
+          <div>
+            <label style="display:block; font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Label</label>
+            <input type="text" name="label" class="search-input" style="width: 190px;" placeholder="e.g. Yumizen H500 - Bay 1" required>
+          </div>
+          <div>
+            <label style="display:block; font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Connection Type</label>
+            <select name="connection_type" id="connectionTypeSelect" class="btn btn-secondary" style="width: 170px;" onchange="toggleConnectionFields()">
+              <option value="network">Network (LAN / TCP)</option>
+              <option value="serial">USB / Serial</option>
+            </select>
+          </div>
+          <div id="networkFields">
+            <label style="display:block; font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">TCP Port</label>
+            <input type="number" name="tcp_port" class="search-input" style="width: 110px;" placeholder="5000" value="5000">
+          </div>
+          <div id="serialFields" style="display: none;">
+            <label style="display:block; font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">COM Port</label>
+            <div style="display: flex; gap: 6px;">
+              <select name="com_port" id="comPortSelect" class="btn btn-secondary" style="width: 150px;">
+                <option value="">Click Refresh &rarr;</option>
+              </select>
+              <button type="button" class="btn btn-secondary btn-icon" onclick="refreshPorts()" title="Rescan COM ports">&#x21bb;</button>
+            </div>
+          </div>
+          <div id="baudRateField" style="display: none;">
+            <label style="display:block; font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:6px;">Baud Rate</label>
+            <select name="baud_rate" class="btn btn-secondary" style="width: 100px;">
+              <option value="9600" selected>9600</option>
+              <option value="19200">19200</option>
+              <option value="38400">38400</option>
+              <option value="57600">57600</option>
+              <option value="115200">115200</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" type="submit" style="padding: 9px 18px;">Add Connection</button>
+        </form>
       </div>
     </details>
   </main>
@@ -1146,7 +1240,7 @@
       <div class="modal-body">
         <div id="printArea" class="vial-card">
           <div class="vial-header">
-            <span class="vial-lab">{{ user_name or 'SK LAB &bull; PATHOLOGY' }}</span>
+            <span class="vial-lab">{{ user_name or 'CLINICAL PATHOLOGY' }}</span>
             <span class="vial-date" id="barcodeDate">2026-09-04</span>
           </div>
           <div class="vial-patient-row">
@@ -1226,6 +1320,36 @@
     document.addEventListener("DOMContentLoaded", () => {
       renderTable();
     });
+
+    function toggleConnectionFields() {
+      const type = document.getElementById('connectionTypeSelect').value;
+      document.getElementById('networkFields').style.display = type === 'network' ? '' : 'none';
+      document.getElementById('serialFields').style.display = type === 'serial' ? '' : 'none';
+      document.getElementById('baudRateField').style.display = type === 'serial' ? '' : 'none';
+      if (type === 'serial') refreshPorts();
+    }
+
+    async function refreshPorts() {
+      const select = document.getElementById('comPortSelect');
+      select.innerHTML = '<option>Scanning...</option>';
+      try {
+        const res = await fetch('/connections/available-ports');
+        const ports = await res.json();
+        select.innerHTML = '';
+        if (!Array.isArray(ports) || ports.length === 0) {
+          select.innerHTML = '<option value="">No COM ports found</option>';
+          return;
+        }
+        ports.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.device;
+          opt.textContent = p.description ? `${p.device} - ${p.description}` : p.device;
+          select.appendChild(opt);
+        });
+      } catch (err) {
+        select.innerHTML = '<option value="">Failed to list ports</option>';
+      }
+    }
 
     function showToast(message, isError = false) {
       const container = document.getElementById("toastContainer");

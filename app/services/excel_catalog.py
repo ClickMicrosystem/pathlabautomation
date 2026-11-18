@@ -7,15 +7,19 @@ from typing import Any, Dict, List
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
-# Lab-side test catalog (the laboratory's own test IDs, used as the mapping
-# target). Updated to the new STAG catalog; the previous SK-lab workbook is
-# no longer used for this side of the mapping.
-LAB_WORKBOOK_PATH = BASE_DIR / "data" / "new stag test ids.xlsx"
+# Lab-side test catalog (the laboratory's own test IDs, used as the mapping target).
+LAB_WORKBOOK_PATH = (
+    (BASE_DIR / "data" / "piysan_lab_test_catalog.xlsx")
+    if (BASE_DIR / "data" / "piysan_lab_test_catalog.xlsx").exists()
+    else (BASE_DIR / "data" / "new stag test ids.xlsx")
+)
 
 # Device/analyzer-side test catalog (HORIBA Yumizen universal test IDs).
-# This sheet is independent of the lab's own ID scheme, so it still comes
-# from the original workbook.
-MACHINE_WORKBOOK_PATH = BASE_DIR / "data" / "SK CBC and ESR test id list.xlsx"
+MACHINE_WORKBOOK_PATH = (
+    (BASE_DIR / "data" / "horiba_device_catalog.xlsx")
+    if (BASE_DIR / "data" / "horiba_device_catalog.xlsx").exists()
+    else (BASE_DIR / "data" / "SK CBC and ESR test id list.xlsx")
+)
 MACHINE_SHEET_NAME = "HorribaTestIDs"
 
 

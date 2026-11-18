@@ -654,12 +654,18 @@
           <h2>Order Parameters</h2>
           <form method="post" action="/push-command/execute" id="formPushCommand">
             <div class="field">
-              <label for="ip">Analyzer IP Address</label>
-              <input type="text" id="ip" name="ip" value="{{ default_ip }}" required placeholder="e.g. 192.168.1.55">
-            </div>
-            <div class="field">
-              <label for="port">Analyzer Service Port</label>
-              <input type="number" id="port" name="port" value="{{ default_port }}" required placeholder="e.g. 5000">
+              <label for="connection_id">Target Connection</label>
+              <select id="connection_id" name="connection_id" required>
+                {% for c in connections %}
+                <option value="{{ c.id }}" {% if c.id == selected_connection_id %}selected{% endif %}>
+                  {{ c.label }} &mdash; {{ 'Network' if c.connection_type == 'network' else 'USB Serial' }}
+                  {% if c.connection_type == 'network' %}(:{{ c.tcp_port }}){% else %}({{ c.com_port }}){% endif %}
+                  {{ '- Running' if c.running else '- Not running' }}
+                </option>
+                {% else %}
+                <option value="" disabled selected>No analyzer connections configured - add one on the Dashboard</option>
+                {% endfor %}
+              </select>
             </div>
             <div class="field">
               <label for="sample_id">Sample Identifier (Barcode)</label>
@@ -705,7 +711,7 @@
           <h2>Print Tube Label</h2>
           <div style="display: flex; flex-direction: column; justify-content: space-between; flex: 1; min-height: 280px; align-items: center; padding-top: 10px;">
             <div class="barcode-sticker" id="barcodeSticker">
-              <div class="barcode-lab-name">Sk Lab Phlebotomy</div>
+              <div class="barcode-lab-name">{{ user_name or 'Pathology' }} Phlebotomy</div>
               <svg id="barcode-svg"></svg>
               <div class="barcode-metadata">
                 <span id="labelPatientId">Patient: -</span>

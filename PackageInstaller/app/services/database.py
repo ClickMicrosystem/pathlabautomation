@@ -85,6 +85,28 @@ def _init_mapping_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS analyzer_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                connection_type TEXT NOT NULL CHECK (connection_type IN ('network','serial')),
+                tcp_port INTEGER,
+                com_port TEXT,
+                baud_rate INTEGER,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO analyzer_connections
+                (id, label, connection_type, tcp_port, com_port, baud_rate, enabled)
+            VALUES (1, 'Default Network', 'network', 5000, NULL, NULL, 1)
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS machine_test_master (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 machine_id INTEGER NOT NULL,
@@ -264,6 +286,63 @@ def load_machines(user_id: int) -> list[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def list_connections() -> list[Dict[str, Any]]:
+    init_databases()
+    with _lock, _connect(MAPPING_DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT * FROM analyzer_connections ORDER BY id ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_connection(connection_id: int) -> Optional[Dict[str, Any]]:
+    init_databases()
+    with _lock, _connect(MAPPING_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT * FROM analyzer_connections WHERE id = ?", (connection_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_connection(
+    label: str,
+    connection_type: str,
+    tcp_port: Optional[int] = None,
+    com_port: Optional[str] = None,
+    baud_rate: Optional[int] = None,
+    enabled: bool = True,
+) -> int:
+    init_databases()
+    with _lock, _connect(MAPPING_DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO analyzer_connections
+                (label, connection_type, tcp_port, com_port, baud_rate, enabled)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (label, connection_type, tcp_port, com_port, baud_rate, 1 if enabled else 0),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def set_connection_enabled(connection_id: int, enabled: bool) -> None:
+    init_databases()
+    with _lock, _connect(MAPPING_DB_PATH) as conn:
+        conn.execute(
+            "UPDATE analyzer_connections SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (1 if enabled else 0, connection_id),
+        )
+        conn.commit()
+
+
+def delete_connection(connection_id: int) -> None:
+    init_databases()
+    with _lock, _connect(MAPPING_DB_PATH) as conn:
+        conn.execute("DELETE FROM analyzer_connections WHERE id = ?", (connection_id,))
+        conn.commit()
+
+
 def save_catalog_rows(rows: list[Dict[str, Any]], target: str) -> None:
     init_databases()
     with _lock, _connect(MAPPING_DB_PATH) as conn:
@@ -416,6 +495,43 @@ def delete_test_mapping(mapping_id: int) -> None:
     with _lock, _connect(MAPPING_DB_PATH) as conn:
         conn.execute("DELETE FROM test_mappings WHERE id = ?", (mapping_id,))
         conn.commit()
+
+
+def seed_default_test_mappings(user_id: int, machine_id: int) -> int:
+    """Pre-seed standard HORIBA Yumizen CBC test mappings if none exist for this user/machine."""
+    init_databases()
+    from app.services.piysan_service import DEFAULT_CBC_MACHINE_TO_LAB_MAP
+    with _lock, _connect(MAPPING_DB_PATH) as conn:
+        existing = conn.execute(
+            "SELECT COUNT(*) as cnt FROM test_mappings WHERE user_id = ? AND machine_id = ?",
+            (user_id, machine_id),
+        ).fetchone()
+        if existing and existing["cnt"] > 0:
+            return existing["cnt"]
+
+        # Build lookup of machine_test_master: test_id -> id
+        m_rows = conn.execute("SELECT id, test_id FROM machine_test_master").fetchall()
+        machine_lookup = {r["test_id"].upper(): r["id"] for r in m_rows}
+
+        # Build lookup of lab_test_master: test_id -> id
+        l_rows = conn.execute("SELECT id, test_id FROM lab_test_master").fetchall()
+        lab_lookup = {r["test_id"]: r["id"] for r in l_rows}
+
+        inserted = 0
+        for m_code, l_code in DEFAULT_CBC_MACHINE_TO_LAB_MAP.items():
+            m_id = machine_lookup.get(m_code.upper())
+            l_id = lab_lookup.get(str(l_code))
+            if m_id and l_id:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO test_mappings (user_id, machine_id, machine_test_master_id, lab_test_master_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (user_id, machine_id, m_id, l_id),
+                )
+                inserted += 1
+        conn.commit()
+        return inserted
 
 
 def load_latest_installation_mapping_lookup() -> Dict[str, str]:
