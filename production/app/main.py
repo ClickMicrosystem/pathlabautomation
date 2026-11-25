@@ -87,9 +87,6 @@ def _listener_watchdog() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    from app.services.license import ensure_licensed
-
-    ensure_licensed()
     init_databases()
     connection_manager.sync_from_db()
     app.state.connection_manager = connection_manager

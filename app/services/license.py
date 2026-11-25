@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 # Public key for the vendor's signing keypair (see tools/license_tool.py
 # genkeypair). Safe to ship - it can only verify signatures, never create
 # them.
-VENDOR_PUBLIC_KEY_B64 = "Wistqp5Mdq6OZqedexaQMbwIMWO5G8frGJkBc1BKCRU="
+VENDOR_PUBLIC_KEY_B64 = "QgwvxJVI6c6qeCTSr13xHmDsr79R/Zclfw0HuKNoq10="
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 LICENSE_PATH = BASE_DIR / "license.lic"

@@ -72,6 +72,18 @@ pip install -r requirements.txt
 .venv\Scripts\python.exe service_installer.py remove
 ```
 
+### Build the production ZIP
+
+From the repository root, run:
+
+```powershell
+.\.venv\Scripts\python.exe tools\create_production_zip.py
+```
+
+This builds one `production.zip` in the repository root from the current
+`app/`, `data/`, and repository installer inputs. Temporary build files are
+cleaned up afterward; any existing `production/` folder is left untouched.
+
 Whichever copy you install from, set `SESSION_SECRET_KEY` and
 `ADMIN_PASSWORD` in its `.env` file before exposing it beyond local testing —
 see the warning logged at startup if `SESSION_SECRET_KEY` is left unset.

@@ -24,6 +24,6 @@ __pycache__/
 artifacts/
 
 # Licensing: the private signing key must never be committed or shipped to
-# a client. Only tools/license_tool.py (vendor-side) touches it.
+# a client. The vendor-side utility is in cLicencingUtility/.
 vendor_private_key.pem
 *.lic
